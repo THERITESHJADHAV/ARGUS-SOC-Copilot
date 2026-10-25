@@ -224,10 +224,13 @@ class InstrumentedNetworkEngine(NetworkDetectionEngine):
                 STATS["benign_count"] += 1
 
         # Record flow history for real-time charts
+        flow_key = self.flow_extractor.get_flow_key(event)
+        pkt_count = len(self.flow_extractor.flows.get(flow_key, [])) or 1
+
         FLOW_HISTORY.append({
             "timestamp": time.time(),
             "time": datetime.now(timezone.utc).isoformat(),
-            "packets": 1,
+            "packets": pkt_count,
             "flows": 1,
             "attacks": 1 if is_attack else 0,
             "prediction": result["prediction"],
@@ -476,6 +479,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 # Serve frontend static files
 FRONTEND_DIR = Path(BACKEND_DIR).parent / "frontend"
 
@@ -497,6 +509,11 @@ async def get_alerts(limit: int = 100, severity: str = None):
     if severity:
         alerts = [a for a in alerts if a.get("severity", "").upper() == severity.upper()]
     return alerts[:limit]
+
+
+@app.get("/api/flows")
+async def get_flows(limit: int = 60):
+    return list(FLOW_HISTORY)[-limit:]
 
 
 @app.post("/api/alerts/clear")
@@ -883,7 +900,7 @@ async def broadcaster():
             _last_alert_count = alert_count
             all_alerts_snap = list(ALERTS)[:100]
 
-        flow_hist_snap = list(FLOW_HISTORY)[-30:]
+        flow_hist_snap = list(FLOW_HISTORY)[-60:]
 
         payload = {
             "type": "update",

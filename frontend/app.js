@@ -23,6 +23,7 @@
   let soundEnabled = true;
   let simRunning = false;
   let activeTab = 'overview';
+  let activeFilterSev = 'all'; // tracks severity filter for alerts view
 
   // Local state cache
   let allAlerts = [];
@@ -199,6 +200,16 @@
         if (dom.pageTitle) {
           dom.pageTitle.textContent = titleMap[tab] || 'ARGUS Security';
         }
+
+        // Trigger chart resize and flow feed update for newly visible tab
+        if (tab === 'network') {
+          if (netTimelineChart) netTimelineChart.resize();
+          if (netMlRatioChart) netMlRatioChart.resize();
+          renderFlowFeed();
+        } else if (tab === 'overview') {
+          if (flowChart) flowChart.resize();
+          if (severityChart) severityChart.resize();
+        }
       });
     });
   }
@@ -337,8 +348,16 @@
 
     // Filter controls for full alerts table
     if (dom.alertSearch) dom.alertSearch.addEventListener('input', renderAlerts);
-    if (dom.filterSev) dom.filterSev.addEventListener('change', renderAlerts);
-    if (dom.filterDet) dom.filterDet.addEventListener('change', renderAlerts);
+
+    // Severity filter BUTTONS in Alerts view
+    document.querySelectorAll('.filter-btn[data-sev]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.filter-btn[data-sev]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeFilterSev = (btn.getAttribute('data-sev') || 'ALL').toLowerCase();
+        renderAlerts();
+      });
+    });
 
     // Export CSV
     if (dom.btnExportCsv) {
@@ -404,7 +423,12 @@
           plugins: { legend: { display: true, position: 'top' } },
           scales: {
             x: { grid: { color: 'rgba(255,255,255,0.05)' } },
-            y: { grid: { color: 'rgba(255,255,255,0.05)' }, beginAtZero: true }
+            y: {
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true,
+              suggestedMax: 10,
+              ticks: { precision: 0 }
+            }
           }
         }
       });
@@ -433,7 +457,7 @@
       });
     }
 
-    // 3. Network View Timeline
+    // 3. Network View Timeline — Attack vs Benign stacked area
     const ctxNetTime = document.getElementById('chart-timeline');
     if (ctxNetTime) {
       netTimelineChart = new Chart(ctxNetTime, {
@@ -442,13 +466,26 @@
           labels: [],
           datasets: [
             {
-              label: 'Total Packets',
+              label: 'Benign Flows',
               data: [],
-              borderColor: '#00f2fe',
-              backgroundColor: 'rgba(0, 242, 254, 0.1)',
+              borderColor: '#22c55e',
+              backgroundColor: 'rgba(34, 197, 94, 0.15)',
               fill: true,
               tension: 0.3,
-              borderWidth: 2
+              borderWidth: 2,
+              pointRadius: 3,
+              pointBackgroundColor: '#22c55e'
+            },
+            {
+              label: 'Attack Flows',
+              data: [],
+              borderColor: '#f43f5e',
+              backgroundColor: 'rgba(244, 63, 94, 0.15)',
+              fill: true,
+              tension: 0.3,
+              borderWidth: 2,
+              pointRadius: 3,
+              pointBackgroundColor: '#f43f5e'
             }
           ]
         },
@@ -458,7 +495,13 @@
           plugins: { legend: { display: true } },
           scales: {
             x: { grid: { color: 'rgba(255,255,255,0.05)' } },
-            y: { grid: { color: 'rgba(255,255,255,0.05)' }, beginAtZero: true }
+            y: {
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              beginAtZero: true,
+              suggestedMax: 10,
+              ticks: { precision: 0 },
+              title: { display: true, text: 'Flows / sec', color: '#94a3b8' }
+            }
           }
         }
       });
@@ -508,37 +551,53 @@
       netMlRatioChart.update();
     }
 
-    if (flowChart && Array.isArray(flowHist) && flowHist.length > 0) {
-      const labels = flowHist.map(h => {
-        if (h.time) {
-          const d = new Date(h.time);
-          return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        }
-        return '--:--';
-      });
-      const pkts = flowHist.map(h => h.packets || h.flows || 0);
-      const attacks = flowHist.map(h => h.attacks || (h.prediction === 'ATTACK' ? 1 : 0));
+    // Aggregate flow history into time-bucketed data for smoother charts
+    const bucketed = bucketFlowHistory(flowHist);
 
-      flowChart.data.labels = labels;
-      flowChart.data.datasets[0].data = pkts;
-      flowChart.data.datasets[1].data = attacks;
+    if (flowChart && bucketed.length > 0) {
+      flowChart.data.labels = bucketed.map(b => b.label);
+      flowChart.data.datasets[0].data = bucketed.map(b => b.packets);
+      flowChart.data.datasets[1].data = bucketed.map(b => b.attacks);
       flowChart.update();
     }
 
-    if (netTimelineChart && Array.isArray(flowHist) && flowHist.length > 0) {
-      const labels = flowHist.map(h => {
-        if (h.time) {
-          const d = new Date(h.time);
-          return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        }
-        return '--:--';
-      });
-      const pkts = flowHist.map(h => h.packets || 0);
-
-      netTimelineChart.data.labels = labels;
-      netTimelineChart.data.datasets[0].data = pkts;
+    if (netTimelineChart && bucketed.length > 0) {
+      netTimelineChart.data.labels = bucketed.map(b => b.label);
+      netTimelineChart.data.datasets[0].data = bucketed.map(b => b.benign);
+      netTimelineChart.data.datasets[1].data = bucketed.map(b => b.attacks);
       netTimelineChart.update();
     }
+  }
+
+  // Bucket raw per-flow entries into 1-second time windows for cleaner charts
+  function bucketFlowHistory(flowHist) {
+    if (!Array.isArray(flowHist) || flowHist.length === 0) return [];
+
+    const buckets = new Map();
+    for (const h of flowHist) {
+      const ts = h.timestamp ? Math.floor(h.timestamp) : (h.time ? Math.floor(new Date(h.time).getTime() / 1000) : 0);
+      if (!ts) continue;
+      if (!buckets.has(ts)) {
+        buckets.set(ts, { ts, packets: 0, attacks: 0, benign: 0, flows: 0 });
+      }
+      const b = buckets.get(ts);
+      b.packets += (h.packets || 1);
+      b.flows += (h.flows || 1);
+      if (h.attacks || h.prediction === 'ATTACK') {
+        b.attacks += 1;
+      } else {
+        b.benign += 1;
+      }
+    }
+
+    const sorted = [...buckets.values()].sort((a, b) => a.ts - b.ts).slice(-60);
+    return sorted.map(b => ({
+      label: new Date(b.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      packets: b.packets,
+      attacks: b.attacks,
+      benign: b.benign,
+      flows: b.flows,
+    }));
   }
 
   // ─────────────────────────────────────────────────────────
@@ -628,6 +687,7 @@
       renderStats();
       renderAlerts();
       renderActivityFeed();
+      renderFlowFeed();
       updateCharts(currentStats, flowHistory);
     } else if (msg.type === 'alert') {
       const newAlert = msg.alert;
@@ -654,7 +714,20 @@
   }
 
   async function fetchInitialData() {
-    await Promise.all([fetchStats(), fetchAlerts(), fetchIocs()]);
+    await Promise.all([fetchStats(), fetchAlerts(), fetchFlows(), fetchIocs()]);
+  }
+
+  async function fetchFlows() {
+    try {
+      const res = await fetch(`${API_BASE}/api/flows`);
+      if (res.ok) {
+        flowHistory = await res.json();
+        renderFlowFeed();
+        updateCharts(currentStats, flowHistory);
+      }
+    } catch (e) {
+      console.warn('Failed to fetch flows:', e);
+    }
   }
 
   async function fetchStats() {
@@ -697,6 +770,7 @@
     renderStats();
     renderAlerts();
     renderActivityFeed();
+    renderFlowFeed();
     renderIocs();
     updateCharts(currentStats, flowHistory);
   }
@@ -731,6 +805,20 @@
     setDetectorDot(dom.detDotOb, det.outbound);
     setDetectorDot(dom.detDotWin, det.windows);
 
+    // Detector alert counts — count alerts per detector from allAlerts
+    const detCounts = { network_ml: 0, port_scan: 0, outbound: 0, windows: 0 };
+    for (const a of allAlerts) {
+      const d = (a.detector || '').toLowerCase();
+      if (d === 'network_ml') detCounts.network_ml++;
+      else if (d === 'port_scan') detCounts.port_scan++;
+      else if (d === 'outbound_detector' || d === 'outbound') detCounts.outbound++;
+      else if (d === 'windows_detector' || d === 'powershell_detector' || d === 'process_detector' || d.includes('win')) detCounts.windows++;
+    }
+    if (dom.detCountMl) dom.detCountMl.textContent = detCounts.network_ml;
+    if (dom.detCountPs) dom.detCountPs.textContent = detCounts.port_scan;
+    if (dom.detCountOb) dom.detCountOb.textContent = detCounts.outbound;
+    if (dom.detCountWin) dom.detCountWin.textContent = detCounts.windows;
+
     // Network View Stats
     if (dom.nPackets) dom.nPackets.textContent = (s.packets_captured || 0).toLocaleString();
     if (dom.nFlows) dom.nFlows.textContent = (s.flows_analyzed || 0).toLocaleString();
@@ -744,6 +832,16 @@
     // Windows View Stats
     if (dom.winAlerts) dom.winAlerts.textContent = s.windows_alerts || 0;
     if (dom.winBruteforce) dom.winBruteforce.textContent = s.windows_alerts || 0;
+
+    // Unique Windows users from alerts
+    const winUsers = new Set();
+    for (const a of allAlerts) {
+      const d = (a.detector || '').toLowerCase();
+      if (d === 'windows_detector' || d === 'powershell_detector' || d === 'process_detector' || d.includes('win')) {
+        if (a.user) winUsers.add(a.user);
+      }
+    }
+    if (dom.winUsers) dom.winUsers.textContent = winUsers.size;
   }
 
   function updateBar(valElem, fillElem, count, total) {
@@ -797,6 +895,48 @@
     dom.activityFeed.innerHTML = items;
   }
 
+  // Render Flow Feed (Network View — Recent Flow Events)
+  function renderFlowFeed() {
+    if (!dom.flowFeed) return;
+
+    if (!Array.isArray(flowHistory) || flowHistory.length === 0) {
+      dom.flowFeed.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">🌐</div>
+          <p>No flows captured yet</p>
+        </div>`;
+      return;
+    }
+
+    // Show most recent flows, newest first
+    const recent = [...flowHistory].reverse().slice(0, 30);
+    const items = recent.map(f => {
+      const isAttack = f.attacks || f.prediction === 'ATTACK';
+      const sev = isAttack ? 'critical' : 'low';
+      const label = isAttack ? 'ATTACK' : 'BENIGN';
+      const srcIp = f.source_ip || 'N/A';
+      const dstIp = f.destination_ip || 'N/A';
+      const timeStr = f.time
+        ? new Date(f.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : '--:--';
+      const prob = f.attack_probability !== undefined
+        ? ` — ${(f.attack_probability * 100).toFixed(1)}%`
+        : '';
+
+      return `
+        <div class="feed-item" data-sev="${sev}">
+          <div class="feed-sev-tag" data-sev="${sev}">${label}</div>
+          <div class="feed-content">
+            <div class="feed-title">${escapeHtml(srcIp)} → ${escapeHtml(dstIp)}</div>
+            <div class="feed-details">ML: ${label}${escapeHtml(prob)} · Packets: ${f.packets || 1}</div>
+          </div>
+          <div class="feed-time">${timeStr}</div>
+        </div>`;
+    }).join('');
+
+    dom.flowFeed.innerHTML = items;
+  }
+
   // Render Alerts Tables (Overview Mini + Full View + Windows View)
   function renderAlerts() {
     const filtered = filterAlerts(allAlerts);
@@ -845,16 +985,13 @@
 
   function filterAlerts(alerts) {
     const search = (dom.alertSearch ? dom.alertSearch.value : '').toLowerCase().trim();
-    const sev = (dom.filterSev ? dom.filterSev.value : 'all').toLowerCase();
-    const det = (dom.filterDet ? dom.filterDet.value : 'all').toLowerCase();
+    const sev = activeFilterSev;
 
     return alerts.filter(a => {
       const aSev = (a.severity || '').toLowerCase();
-      const aDet = (a.detector || '').toLowerCase();
       const fullText = `${a.title || ''} ${a.alert_type || ''} ${a.type || ''} ${a.description || ''} ${a.source_ip || ''} ${a.target_ip || ''} ${a.destination_ip || ''}`.toLowerCase();
 
       if (sev !== 'all' && aSev !== sev) return false;
-      if (det !== 'all' && !aDet.includes(det)) return false;
       if (search && !fullText.includes(search)) return false;
 
       return true;
